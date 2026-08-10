@@ -28,10 +28,10 @@ pub fn patch(b: *std.Build, options: Options) std.Build.LazyPath {
     execute_runner.addFileArg(patch_dep.artifact("patch").getEmittedBin());
 
     // Directory we are going to patch
-    execute_runner.addDirectoryArg2(options.root_directory, .{});
+    execute_runner.addDirectoryArg(options.root_directory);
 
     // Output of the patching process
-    const output = execute_runner.addOutputDirectoryArg2(options.patch_dep_name, .{});
+    const output = execute_runner.addOutputDirectoryArg(options.patch_dep_name);
 
     // Strip arg
     execute_runner.addArg(b.fmt("{d}", .{options.strip}));
