@@ -1,16 +1,7 @@
 const std = @import("std");
 const fs = std.fs;
-const Step = std.Build.Step;
 const LazyPath = std.Build.LazyPath;
-const GeneratedFile = std.Build.GeneratedFile;
 const PatchStep = @This();
-
-step: Step,
-patch_exe: *Step.Compile,
-root_directory: LazyPath,
-generated_directory: GeneratedFile,
-patch_files: std.ArrayList(LazyPath),
-strip: u32,
 
 pub const Options = struct {
     root_directory: LazyPath,
@@ -18,168 +9,40 @@ pub const Options = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     strip: u32 = 0,
+    patches: []const std.Build.LazyPath,
 };
 
-pub fn create(b: *std.Build, options: Options) *PatchStep {
-    const step = Step.init(.{
-        .id = .custom,
-        .name = "patch",
-        .owner = b,
-        .makeFn = make,
-    });
-    const patch_exe = b.dependency(options.patch_dep_name, .{
+pub fn patch(b: *std.Build, options: Options) std.Build.LazyPath {
+    const patch_dep = b.dependency(options.patch_dep_name, .{
         .target = options.target,
         .optimize = options.optimize,
-    }).artifact("patch");
-    const root_directory = options.root_directory.dupe(b);
+    });
 
-    const patch = b.allocator.create(PatchStep) catch @panic("OOM");
-    patch.* = .{
-        .step = step,
-        .patch_exe = patch_exe,
-        .root_directory = root_directory,
-        .generated_directory = .{ .step = &patch.step },
-        .patch_files = .empty,
-        .strip = options.strip,
-    };
-    root_directory.addStepDependencies(&patch.step);
-    patch.step.dependOn(&patch_exe.step);
-    return patch;
-}
+    // Grab runner
+    const runner = patch_dep.artifact("patch_runner");
 
-pub fn getDirectory(patch: *PatchStep) LazyPath {
-    return .{ .generated = .{ .file = &patch.generated_directory } };
-}
+    // Create run artifact
+    var execute_runner = b.addRunArtifact(runner);
 
-pub fn addPatch(patch: *PatchStep, file: LazyPath) void {
-    patch.patch_files.append(patch.step.owner.allocator, file) catch @panic("OOM");
-}
+    // Patch executable
+    execute_runner.addFileArg(patch_dep.artifact("patch").getEmittedBin());
 
-fn make(step: *Step, options: Step.MakeOptions) !void {
-    const b = step.owner;
-    const patch: *PatchStep = @fieldParentPtr("step", step);
+    // Directory we are going to patch
+    execute_runner.addDirectoryArg2(options.root_directory, .{});
 
-    const exe_cache_path = patch.patch_exe.getEmittedBin().getPath3(b, step);
+    // Output of the patching process
+    const output = execute_runner.addOutputDirectoryArg2(options.patch_dep_name, .{});
 
-    const root_path = patch.root_directory.getPath3(b, step);
-    var root_directory = root_path.openDir(b.graph.io, ".", .{ .iterate = true }) catch |err| {
-        const abs_path = root_path.toString(b.allocator) catch @panic("OOM");
-        return step.fail("unable to open directory '{s}': {s}", .{
-            abs_path, @errorName(err),
-        });
-    };
+    // Strip arg
+    execute_runner.addArg(b.fmt("{d}", .{options.strip}));
 
-    var man = b.graph.cache.obtain();
-    defer man.deinit();
-
-    man.hash.add(@as(u32, 0xEB465BF1));
-    man.hash.addBytes(exe_cache_path.sub_path);
-    {
-        var it = try root_directory.walk(b.allocator);
-        defer it.deinit();
-        while (try it.next(b.graph.io)) |entry| {
-            switch (entry.kind) {
-                .file => {
-                    const file_path = try root_path.join(b.allocator, entry.path);
-                    _ = try man.addFilePath(file_path, null);
-                },
-                else => continue,
-            }
-        }
-    }
-    for (patch.patch_files.items) |patch_file| {
-        const patch_path = patch_file.getPath3(b, step);
-        _ = try man.addFilePath(patch_path, null);
+    // Add patches are input arguments
+    for (options.patches) |p| {
+        execute_runner.addFileArg(p);
     }
 
-    if (try step.cacheHitAndWatch(&man)) {
-        const digest = man.final();
-        patch.generated_directory.path = try b.cache_root.join(b.allocator, &.{ "o", &digest });
-        return;
-    }
+    execute_runner.addCheck(.{ .expect_term = .{ .exited = 0 } });
 
-    const digest = man.final();
-    const cache_path = b.pathJoin(&.{ "o", &digest });
-    const absolute_cache_path = try b.cache_root.join(b.allocator, &.{ "o", &digest });
-    patch.generated_directory.path = absolute_cache_path;
-
-    var cache_dir = b.cache_root.handle.createDirPathOpen(b.graph.io, cache_path, .{}) catch |err| {
-        return step.fail("unable to make path '{f}{s}': {s}", .{
-            b.cache_root, cache_path, @errorName(err),
-        });
-    };
-    defer cache_dir.close(b.graph.io);
-
-    // copy everything from root_directory to cache_dir
-    {
-        var progress_node = options.progress_node.start(b.fmt("copy root dir {s}", .{patch.root_directory.getDisplayName()}), 0);
-        defer progress_node.end();
-        var it = try root_directory.walk(b.allocator);
-        defer it.deinit();
-        while (try it.next(b.graph.io)) |entry| {
-            switch (entry.kind) {
-                .directory => cache_dir.createDirPath(b.graph.io, entry.path) catch |err| {
-                    return step.fail("unable to make path '{f}{s}{c}{s}': {s}", .{
-                        b.cache_root, cache_path, fs.path.sep, entry.path, @errorName(err),
-                    });
-                },
-                .file => {
-                    const prev_status = std.Io.Dir.updateFile(
-                        root_directory,
-                        b.graph.io,
-                        entry.path,
-                        cache_dir,
-                        entry.path,
-                        .{},
-                    ) catch |err| {
-                        return step.fail("unable to update file from '{s}' to '{any}{s}{c}{s}': {s}", .{
-                            entry.path, b.cache_root, cache_path, fs.path.sep, entry.path, @errorName(err),
-                        });
-                    };
-                    _ = prev_status;
-                },
-                else => continue,
-            }
-        }
-    }
-    options.progress_node.increaseEstimatedTotalItems(patch.patch_files.items.len);
-    for (patch.patch_files.items) |patch_file| {
-        var argv_list: std.ArrayList([]const u8) = .empty;
-        defer argv_list.deinit(b.allocator);
-
-        try argv_list.append(b.allocator, exe_cache_path.sub_path);
-        try argv_list.append(b.allocator, "--strip");
-        try argv_list.append(b.allocator, b.fmt("{d}", .{patch.strip}));
-        try argv_list.append(b.allocator, "--quiet");
-        try argv_list.append(b.allocator, "--no-backup-if-mismatch");
-        if (patch.patch_exe.rootModuleTarget().os.tag == .windows) {
-            try argv_list.append(b.allocator, "--binary");
-        }
-        try argv_list.append(b.allocator, "--directory");
-        try argv_list.append(b.allocator, absolute_cache_path);
-        var progress_node = options.progress_node.start(b.fmt("patch apply {s}", .{patch_file.getDisplayName()}), 0);
-        defer progress_node.end();
-        const patch_path = patch_file.getPath3(b, step);
-        try argv_list.append(b.allocator, "--input");
-        try argv_list.append(b.allocator, b.pathResolve(&.{ patch_path.root_dir.path orelse ".", patch_path.sub_path }));
-
-        var child = std.process.spawn(b.graph.io, .{
-            .argv = argv_list.items,
-            .cwd = .{ .dir = exe_cache_path.root_dir.handle },
-            .environ_map = &b.graph.environ_map,
-            .stdin = .ignore,
-            .stdout = .ignore,
-            .stderr = .ignore,
-        }) catch |err| {
-            return step.fail("unable to spawn patch process {}: {s}", .{
-                exe_cache_path, @errorName(err),
-            });
-        };
-        _ = child.wait(b.graph.io) catch |err| {
-            return step.fail("patch process failed: {s}", .{@errorName(err)});
-        };
-        options.progress_node.setCompletedItems(1);
-    }
-
-    try man.writeManifest();
+    // Return the result of executing the patch runner
+    return output;
 }

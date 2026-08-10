@@ -302,4 +302,15 @@ pub fn build(b: *std.Build) void {
         .root_module = patch_mod,
     });
     b.installArtifact(patch);
+
+    // Patch runner
+    const runner = b.addExecutable(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = .Debug,
+            .root_source_file = b.path("src/main.zig"),
+        }),
+        .name = "patch_runner",
+    });
+    b.installArtifact(runner);
 }
