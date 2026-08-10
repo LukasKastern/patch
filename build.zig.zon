@@ -10,6 +10,7 @@
         },
     },
     .paths = .{
+        "src/main.zig",
         "PatchStep.zig",
         "build.zig",
         "build.zig.zon",
