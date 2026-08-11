@@ -13,7 +13,6 @@ pub fn main(init: std.process.Init) !void {
     const output_dir_path = arg_it.next() orelse return error.InvalidInput;
     const strip = arg_it.next() orelse return error.InvalidInput;
 
-    // Copy from input dir to output
     var cwd = std.Io.Dir.cwd();
 
     // Open output dir
